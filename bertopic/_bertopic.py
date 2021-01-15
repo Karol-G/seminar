@@ -21,6 +21,10 @@ from ._ctfidf import ClassTFIDF
 from ._utils import MyLogger, check_documents_type, check_embeddings_shape, check_is_fitted
 from ._embeddings import languages, embedding_models
 from ._mmr import mmr
+import time
+import copy
+import os
+from tqdm import tqdm
 
 # Additional dependencies
 try:
@@ -86,7 +90,8 @@ class BERTopic:
                  vectorizer: CountVectorizer = None,
                  calculate_probabilities: bool = True,
                  allow_st_model: bool = True,
-                 huggingface_model: bool = False):
+                 huggingface_model: bool = False,
+                 sub_cluster: list = None):
         """BERTopic initialization
 
         Args:
@@ -174,6 +179,17 @@ class BERTopic:
         self.topic_sim_matrix = None
         self.custom_embeddings = False
 
+        self.verbose = verbose
+
+        self.umap_embeddings = None
+        self.documents = None
+        if sub_cluster is None:
+            self.sub_cluster = []
+        else:
+            self.sub_cluster = sub_cluster
+        self.data_save_path = None
+        self.name = None
+
         if verbose:
             logger.set_level("DEBUG")
 
@@ -218,8 +234,7 @@ class BERTopic:
 
     def fit_transform(self,
                       documents: List[str],
-                      embeddings: np.ndarray = None) -> Tuple[List[int],
-                                                              Union[np.ndarray, None]]:
+                      embeddings: np.ndarray = None, umap_embeddings: np.ndarray = None):
         """ Fit the models on a collection of documents, generate topics, and return the docs with topics
 
         Arguments:
@@ -266,29 +281,88 @@ class BERTopic:
         documents = pd.DataFrame({"Document": documents,
                                   "ID": range(len(documents)),
                                   "Topic": None})
+        self.documents = documents
 
-        # Extract embeddings
-        if not any([isinstance(embeddings, np.ndarray), isinstance(embeddings, csr_matrix)]):
-            embeddings = self._extract_embeddings(documents.Document)
-        else:
-            self.custom_embeddings = True
+        if umap_embeddings is None:
+            # Extract embeddings
+            print("Extract embeddings...")
+            start_time = time.time()
+            if not any([isinstance(embeddings, np.ndarray), isinstance(embeddings, csr_matrix)]):
+                embeddings = self._extract_embeddings(documents.Document)
+            else:
+                self.custom_embeddings = True
+            print("Elapsed time: ", time.time() - start_time)
 
-        # Reduce dimensionality with UMAP
-        umap_embeddings = self._reduce_dimensionality(embeddings)
+            # Reduce dimensionality with UMAP
+            print("Reduce dimensionality with UMAP...")
+            start_time = time.time()
+            umap_embeddings = self._reduce_dimensionality(embeddings)
+            print("Elapsed time: ", time.time() - start_time)
+        self.umap_embeddings = umap_embeddings
 
         # Cluster UMAP embeddings with HDBSCAN
-        documents, probabilities, linkage_tree = self._cluster_embeddings(umap_embeddings, documents)
+        print("Cluster UMAP embeddings with HDBSCAN...")
+        start_time = time.time()
+        documents, probabilities, cluster_model = self._cluster_embeddings(umap_embeddings, documents)
+        print("Elapsed time: ", time.time() - start_time)
 
         # Extract topics by calculating c-TF-IDF
+        print("Extract topics by calculating c-TF-IDF...")
+        start_time = time.time()
         self._extract_topics(documents)
+        print("Elapsed time: ", time.time() - start_time)
 
         if self.nr_topics:
+            print("Reduce topics...")
+            start_time = time.time()
             documents = self._reduce_topics(documents)
             probabilities = self._map_probabilities(probabilities)
+            print("Elapsed time: ", time.time() - start_time)
 
         predictions = documents.Topic.to_list()
 
         return predictions, probabilities
+
+    def sub_fit_transform_all(self, min_cluster_size=100):
+        topics = self.get_topic_freq()
+        for index, row in tqdm(topics.iterrows(), total=len(topics)):
+            if row["Topic"] != -1 and min_cluster_size < row["Count"]:
+                sub_model = self.sub_fit_transform(row["Topic"])
+                sub_model.sub_fit_transform_all()
+
+    def sub_fit_transform(self, topic_id):
+        sub_documents = self.documents[self.documents.Topic == topic_id].Document.to_numpy()
+        sub_umap_embeddings = self.umap_embeddings[self.documents.Topic == topic_id]
+        sub_cluster = copy.deepcopy(self.sub_cluster)
+        sub_cluster.append(topic_id)
+        sub_model = BERTopic(self.language, self.embedding_model, self.top_n_words, self.nr_topics,
+                             self.n_gram_range, self.min_topic_size, self.n_neighbors, self.n_components,
+                             self.stop_words, self.verbose, self.vectorizer, self.calculate_probabilities,
+                             self.allow_st_model, self.huggingface_model, sub_cluster=sub_cluster)
+        sub_model.fit_transform(sub_documents, umap_embeddings=sub_umap_embeddings)
+        sub_model.save(self.data_save_path, self.name)
+        return sub_model
+
+    def extract_topics_all(self, min_cluster_size=100):
+        topic_hierachy = []
+        topics = self.get_topic_freq()
+        for index, row in topics.iterrows():
+            sub_topic_hierachy = {}
+            sub_topic_hierachy["Index"] = row["Topic"]
+            sub_topic_hierachy["Size"] = row["Count"]
+            sub_topic_hierachy["Topic-Words"] = self.get_topic(row["Topic"])
+            sub_topic_hierachy["Sub-Topics"] = None
+            if row["Topic"] != -1 and min_cluster_size < row["Count"]:
+                sub_cluster = copy.deepcopy(self.sub_cluster)
+                sub_cluster.append(row["Topic"])
+                sub_model = BERTopic(self.language, self.embedding_model, self.top_n_words, self.nr_topics,
+                                     self.n_gram_range, self.min_topic_size, self.n_neighbors, self.n_components,
+                                     self.stop_words, self.verbose, self.vectorizer, self.calculate_probabilities,
+                                     self.allow_st_model, self.huggingface_model, sub_cluster=sub_cluster)
+                sub_model = sub_model.load(self.data_save_path, self.name)
+                sub_topic_hierachy["Sub-Topics"] = sub_model.extract_topics_all()
+                topic_hierachy.append(sub_topic_hierachy)
+        return topic_hierachy
 
     def transform(self,
                   documents: Union[str, List[str]],
@@ -657,7 +731,7 @@ class BERTopic:
         if save:
             fig.savefig("probability.png", dpi=300, bbox_inches='tight')
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, name: str) -> None:
         """ Saves the model to the specified path
 
         Arguments:
@@ -669,11 +743,17 @@ class BERTopic:
         model.save("my_model")
         ```
         """
-        with open(path, 'wb') as file:
+        self.data_save_path = path
+        self.name = name
+        for sub_cluster in self.sub_cluster:
+            name += "_" + str(sub_cluster)
+        name += ".model"
+
+        with open(os.path.join(path, name), 'wb') as file:
             joblib.dump(self, file)
 
-    @classmethod
-    def load(cls, path: str):
+    #@classmethod
+    def load(self, path: str, name: str):
         """ Loads the model from the specified path
 
         Arguments:
@@ -685,10 +765,14 @@ class BERTopic:
         BERTopic.load("my_model")
         ```
         """
-        with open(path, 'rb') as file:
+        for sub_cluster in self.sub_cluster:
+            name += "_" + str(sub_cluster)
+        name += ".model"
+
+        with open(os.path.join(path, name), 'rb') as file:
             return joblib.load(file)
 
-    def _extract_embeddings(self, documents: List[str], show_progress_bar: bool = False) -> np.ndarray:
+    def _extract_embeddings(self, documents: List[str], show_progress_bar: bool = True) -> np.ndarray:
         """ Extract sentence/document embeddings through pre-trained embeddings
         For an overview of pre-trained models: https://www.sbert.net/docs/pretrained_models.html
 
@@ -757,8 +841,6 @@ class BERTopic:
                                              cluster_selection_method='eom',
                                              prediction_data=True).fit(umap_embeddings)
         documents['Topic'] = self.cluster_model.labels_
-        linkage_tree = self.cluster_model._single_linkage_tree
-        print("linkage_tree: ", linkage_tree)
 
         if self.calculate_probabilities:
             probabilities = hdbscan.all_points_membership_vectors(self.cluster_model)
@@ -767,7 +849,7 @@ class BERTopic:
 
         self._update_topic_size(documents)
         logger.info("Clustered UMAP embeddings with HDBSCAN")
-        return documents, probabilities, linkage_tree
+        return documents, probabilities, self.cluster_model
 
     def _extract_topics(self, documents: pd.DataFrame):
         """ Extract topics from the clusters using a class-based TF-IDF
